@@ -1,0 +1,9 @@
+mysql:
+  host: 10.84.208.12
+  port: 3306
+  username: tuser
+  password: 1234zxcv
+  database: datagos
+
+server:
+  port: 8000
