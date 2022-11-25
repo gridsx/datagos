@@ -23,10 +23,9 @@ func (h *BinlogHandler) OnRow(e *canal.RowsEvent) error {
 	// TODO 在sink之后，内存记录位点， 位点定时刷新到 DB中去， 这样如果任务终止，或者任务本身有错误
 	// 可以通过重新拾取sink之前成功的位点继续消费， 间接保证数据一致性
 	count++
-	if count%10000 == 0 {
-		log.Infof("onRow binlog num:%d, time %v", count, time.Now())
+	if count%100000 == 0 {
+		log.Infof("onRow binlog_num: %d, time %v", count, time.Now())
 	}
-
 	for _, sinker := range h.Sinkers {
 		if !sinker.enable() {
 			continue

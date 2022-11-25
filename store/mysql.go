@@ -31,7 +31,7 @@ func initDb() {
 		db.SetMaxOpenConns(5)
 		pingErr := db.Ping()
 		if pingErr != nil {
-			log.Println(pingErr.Error())
+			panic(pingErr)
 			return
 		}
 		localDb = db

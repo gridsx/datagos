@@ -48,7 +48,7 @@ func (s *MySQLSinker) onEvent(e *canal.RowsEvent) error {
 	}
 	// 写入MySQL
 	for _, v := range s.Consumers {
-		// 此处需要异步处理，一个携程处理一个consumer
+		// TODO 此处需要异步处理，一个携程处理一个consumer
 		go v.Accept(e)
 	}
 	return nil
@@ -86,6 +86,7 @@ func (c *MySQLConsumer) Accept(e *canal.RowsEvent) error {
 
 // 执行落库
 // todo 主键修改尚未完成，应该解析成一条插入一条删除， 此场景比较少
+// TODO 看binlog来的姿势来看， update 和 insert 很有可能是批量来的， 主要是为了提高速率
 func (c *MySQLConsumer) exec(e *canal.RowsEvent) error {
 	var stmt *sql.Stmt
 	switch e.Action {
