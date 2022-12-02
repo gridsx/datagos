@@ -1,6 +1,7 @@
 package meta
 
 import (
+	"database/sql"
 	"encoding/json"
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/gridsx/datagos/store"
@@ -27,6 +28,7 @@ const (
 const (
 	// 实例表操作
 	getInstanceSql     = `select id, host, port, username, password, state, position,  dump_config, created, updated FROM instances WHERE state =? `
+	getInstancesSql    = `select id, host, port, username, password, state, position,  dump_config, created, updated FROM instances`
 	getInstanceByIdSql = `select id, host, port, username, password, state, position,  dump_config, created, updated FROM instances WHERE id =? AND state != 7`
 
 	updatePositionSql   = `update instances set position = ? where id = ?`
@@ -39,7 +41,13 @@ const (
 )
 
 func (m *metaManager) GetInstances(state InstanceState) ([]*InstanceInfo, error) {
-	rows, err := db.Query(getInstanceSql, state)
+	var rows *sql.Rows
+	var err error
+	if state < 0 {
+		rows, err = db.Query(getInstancesSql)
+	} else {
+		rows, err = db.Query(getInstanceSql, state)
+	}
 	if err != nil {
 		return nil, err
 	}

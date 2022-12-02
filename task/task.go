@@ -202,6 +202,11 @@ func NewCanalTask(s *meta.InstanceInfo, sinkers []sinker.Sinker) *CanalTask {
 	cfg.Addr = fmt.Sprintf("%s:%d", c.MasterInfo.Host, c.MasterInfo.Port)
 	cfg.User = c.MasterInfo.Username
 	cfg.Password = c.MasterInfo.Password
+	cfg.HeartbeatPeriod = time.Second * 5
+
+	// TODO 补充 filter.
+	// cfg.ExcludeTableRegex, 是否拉取这个日志
+	// cfg.IncludeTableRegex， 是否拉取
 
 	if c.DumpFilter != nil {
 		// 全量配置相关
