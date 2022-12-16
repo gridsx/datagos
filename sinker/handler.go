@@ -6,10 +6,7 @@ import (
 	"github.com/go-mysql-org/go-mysql/replication"
 	"github.com/gridsx/datagos/meta"
 	"github.com/siddontang/go-log/log"
-	"time"
 )
-
-var count int = 0
 
 type BinlogHandler struct {
 	canal.DummyEventHandler
@@ -22,10 +19,6 @@ type BinlogHandler struct {
 func (h *BinlogHandler) OnRow(e *canal.RowsEvent) error {
 	// TODO 在sink之后，内存记录位点， 位点定时刷新到 DB中去， 这样如果任务终止，或者任务本身有错误
 	// 可以通过重新拾取sink之前成功的位点继续消费， 间接保证数据一致性
-	count++
-	if count%100000 == 0 {
-		log.Infof("onRow binlog_num: %d, time %v", count, time.Now())
-	}
 	for _, sinker := range h.Sinkers {
 		if !sinker.enable() {
 			continue
@@ -57,5 +50,6 @@ func (h *BinlogHandler) OnDDL(nextPos mysql.Position, queryEvent *replication.Qu
 // 这些时候也保存一下 binlog 位点, 会不会跟5秒一次的冲突？？
 func (h *BinlogHandler) saveBinlogPos() error {
 	pos := h.C.SyncedPosition()
+	h.C.GetMasterPos()
 	return meta.Manager.SavePosition(h.Inst.Id, pos)
 }

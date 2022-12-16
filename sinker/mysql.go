@@ -46,14 +46,17 @@ func (s *MySQLSinker) onEvent(e *canal.RowsEvent) error {
 		return nil
 	}
 	// 写入MySQL
+	wg := sync.WaitGroup{}
 	for _, v := range s.Consumers {
-		// TODO 此处需要异步处理，一个携程处理一个consumer
 		go func() {
+			wg.Add(1)
 			err := v.Accept(e)
 			if err != nil {
 				log.Errorf("event execute error: %s\n", err.Error())
 			}
+			wg.Done()
 		}()
+		wg.Wait()
 	}
 	return nil
 }
