@@ -29,7 +29,7 @@ func (f *TableFilter) actionIgnored(name string) bool {
 
 func (f *TableFilter) Match(e *canal.RowsEvent) bool {
 	if len(f.IncludeTables) > 0 {
-		return inList(e.Table.Name, f.IncludeTables)
+		return !inList(e.Table.Name, f.IncludeTables)
 	}
 	return f.tableIgnored(e.Table.Name) || f.schemaIgnored(e.Table.Schema) || f.actionIgnored(e.Action)
 }

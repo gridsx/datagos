@@ -203,6 +203,7 @@ func NewCanalTask(s *meta.InstanceInfo, sinkers []sinker.Sinker) *CanalTask {
 	cfg.User = c.MasterInfo.Username
 	cfg.Password = c.MasterInfo.Password
 	cfg.HeartbeatPeriod = time.Second * 5
+	cfg.DiscardNoMetaRowEvent = true
 
 	// TODO 补充 filter.
 	// cfg.ExcludeTableRegex, 是否拉取这个日志

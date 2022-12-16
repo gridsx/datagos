@@ -2,12 +2,11 @@ package sinker
 
 import (
 	"database/sql"
-	"errors"
 	"fmt"
+	"github.com/antonmedv/expr"
 	"strings"
 	"sync"
 
-	"github.com/antonmedv/expr"
 	"github.com/go-mysql-org/go-mysql/canal"
 	"github.com/gridsx/datagos/filter"
 	"github.com/gridsx/datagos/mapper"
@@ -15,7 +14,7 @@ import (
 )
 
 type MySQLSinker struct {
-	disabled      bool             `json:"-"`
+	disabled      bool
 	ErrorContinue bool             `json:"errorContinue"`
 	Filters       []filter.Filter  `json:"filters"`
 	Consumers     []*MySQLConsumer `json:"consumers"`
@@ -49,7 +48,12 @@ func (s *MySQLSinker) onEvent(e *canal.RowsEvent) error {
 	// 写入MySQL
 	for _, v := range s.Consumers {
 		// TODO 此处需要异步处理，一个携程处理一个consumer
-		go v.Accept(e)
+		go func() {
+			err := v.Accept(e)
+			if err != nil {
+				log.Errorf("event execute error: %s\n", err.Error())
+			}
+		}()
 	}
 	return nil
 }
@@ -60,13 +64,9 @@ func (s *MySQLSinker) continueOnError() bool {
 
 // MySQLConsumer 目前需要自己手动建表， 意味着 Mapping 不能为空
 type MySQLConsumer struct {
-	DB          *sql.DB
-	Mapping     *mapper.TableMapping
-	InsertStmt  *sql.Stmt
-	ReplaceStmt *sql.Stmt
-	DeleteStmt  *sql.Stmt
-	ValuePos    []int // 适用于 insert/update 不适用于delete
-	Lock        sync.Mutex
+	DB      *sql.DB
+	Mapping *mapper.TableMapping
+	Lock    sync.Mutex
 }
 
 func (c *MySQLConsumer) Name() string {
@@ -74,94 +74,131 @@ func (c *MySQLConsumer) Name() string {
 }
 
 func (c *MySQLConsumer) Accept(e *canal.RowsEvent) error {
-	if e == nil || e.Table.Schema != e.Table.Schema || e.Table.Name != c.Mapping.SrcTable {
+	if e == nil || e.Table == nil || e.Table.Name != c.Mapping.SrcTable {
 		// 如果不是此处理器需要处理的事情，则不处理
 		return nil
-	}
-	if err := c.prepare(e); err != nil {
-		return err
 	}
 	return c.exec(e)
 }
 
 // 执行落库
 // TODO 主键修改尚未完成，应该解析成一条插入一条删除， 此场景比较少
-// TODO 看binlog来的姿势来看， update 和 insert 很有可能是批量来的， 主要是为了提高速率
-// preparedStmt 会执行的快一些， 因此要使用preparedStmt, 但是，由于
-
 func (c *MySQLConsumer) exec(e *canal.RowsEvent) error {
-	var stmt *sql.Stmt
+	var resultSql string
+	var pos []int
 	switch e.Action {
-	case canal.InsertAction:
-		stmt = c.InsertStmt
-	case canal.UpdateAction:
-		stmt = c.ReplaceStmt
+	case canal.UpdateAction, canal.InsertAction:
+		resultSql, pos = c.toInsert(e)
 	case canal.DeleteAction:
-		stmt = c.DeleteStmt
+		resultSql, pos = c.toDelete(e)
 	default:
-		return nil
 	}
-	values := c.prepareValues(e)
-	_, err := stmt.Exec(values...)
+	values := c.prepareValues(e, pos)
+	_, err := c.DB.Exec(resultSql, values...)
 	if err != nil {
-		log.Errorf("error executing insert sql, sql: %s, error: %s", stmt, err.Error())
+		log.Errorf("error executing sql: %s, err:%s\n", resultSql, err.Error())
 		return err
 	}
 	return nil
 }
 
-func (c *MySQLConsumer) prepareValues(e *canal.RowsEvent) []interface{} {
+func (c *MySQLConsumer) prepareValues(e *canal.RowsEvent, valuePos []int) []interface{} {
 	// 准备值
 	values := make([]interface{}, 0, 8)
 	if canal.DeleteAction == e.Action {
-		for _, v := range e.Table.PKColumns {
-			values = append(values, e.Rows[0][v])
+		// 构造 delete 的value列表
+		for i := range e.Rows {
+			for _, v := range e.Table.PKColumns {
+				values = append(values, e.Rows[i][v])
+			}
 		}
+
 	} else {
-		for _, v := range c.ValuePos {
-			if e.Action == canal.UpdateAction {
-				values = append(values, e.Rows[1][v])
-			} else if e.Action == canal.InsertAction {
-				values = append(values, e.Rows[0][v])
+		// 构造 insert 和update 的 value列表
+		if e.Action == canal.UpdateAction {
+			// update的话，偶数行是
+			rowNum := len(e.Rows)
+			for i := 0; i < rowNum; i += 2 {
+				if i+1 >= rowNum {
+					break
+				}
+				valueRow := e.Rows[i+1]
+				for _, v := range valuePos {
+					values = append(values, valueRow[v])
+				}
+			}
+		} else {
+			for i := range e.Rows {
+				for _, v := range valuePos {
+					values = append(values, e.Rows[i][v])
+				}
 			}
 		}
 	}
 
 	// 字段映射值处理逻辑， 用于处理值映射问题
 	if c.Mapping != nil && c.Mapping.ColMappings != nil {
-		for i, cm := range c.Mapping.ColMappings {
-			if len(cm.Expr) > 0 {
-				envMap := make(map[string]interface{}, 8)
-				if e.Action == canal.UpdateAction {
-					envMap["last"] = e.Rows[0][c.ValuePos[i]]
-					envMap["current"] = e.Rows[1][c.ValuePos[i]]
-				} else if e.Action == canal.InsertAction {
-					envMap["current"] = e.Rows[0][c.ValuePos[i]]
-				} else if e.Action == canal.DeleteAction {
-					// 对于delete对应的 value的值的位置不等， 因此要取的值比较麻烦一些
-					// 找出SRC 字段, 如果不是主键忽略， 如果是主键字段，则需要根据SRC找到原字段所在位置
-					for _, v := range e.Table.PKColumns {
-						if cm.Src == e.Table.Columns[v].Name {
-							// 如果映射的是主键， 那么需要对应映射做好
-							envMap["current"] = e.Rows[0][v]
-							break
+		rowLen := len(e.Rows)
+		if e.Action == canal.UpdateAction {
+			for r := 0; r < rowLen; r += 2 {
+				if r+1 >= rowLen {
+					break
+				}
+				for i, cm := range c.Mapping.ColMappings {
+					if len(cm.Expr) > 0 {
+						envMap := make(map[string]interface{}, 8)
+						envMap["last"] = e.Rows[r][valuePos[i]]
+						envMap["current"] = e.Rows[r+1][valuePos[i]]
+						envMap["mapTo"] = mapTo
+						program, err := expr.Compile(cm.Expr, expr.Env(envMap))
+						output, err := expr.Run(program, envMap)
+						if err == nil {
+							values[valuePos[i]] = output
 						}
 					}
 				}
-				envMap["mapTo"] = mapTo
-				program, err := expr.Compile(cm.Expr, expr.Env(envMap))
-				output, err := expr.Run(program, envMap)
-				if err == nil {
-					if e.Action == canal.DeleteAction {
-						for kp, v := range e.Table.PKColumns {
+			}
+		} else if e.Action == canal.DeleteAction {
+			for r := 0; r < rowLen; r++ {
+				for i, cm := range c.Mapping.ColMappings {
+					if len(cm.Expr) > 0 {
+						envMap := make(map[string]interface{}, 8)
+						// 对于delete对应的 value的值的位置不等， 因此要取的值比较麻烦一些
+						// 找出SRC 字段, 如果不是主键忽略， 如果是主键字段，则需要根据SRC找到原字段所在位置
+						for _, v := range e.Table.PKColumns {
 							if cm.Src == e.Table.Columns[v].Name {
 								// 如果映射的是主键， 那么需要对应映射做好
-								values[kp] = output
+								envMap["current"] = e.Rows[i][v]
 								break
 							}
 						}
-					} else {
-						values[c.ValuePos[i]] = output
+						envMap["mapTo"] = mapTo
+						program, err := expr.Compile(cm.Expr, expr.Env(envMap))
+						output, err := expr.Run(program, envMap)
+						if err == nil && e.Action == canal.DeleteAction {
+							for kp, v := range e.Table.PKColumns {
+								if cm.Src == e.Table.Columns[v].Name {
+									// 如果映射的是主键， 那么需要对应映射做好
+									values[kp] = output
+									break
+								}
+							}
+						}
+					}
+				}
+			}
+		} else if e.Action == canal.InsertAction {
+			for r := 0; r < rowLen; r++ {
+				for i, cm := range c.Mapping.ColMappings {
+					if len(cm.Expr) > 0 {
+						envMap := make(map[string]interface{}, 8)
+						envMap["current"] = e.Rows[r][valuePos[i]]
+						envMap["mapTo"] = mapTo
+						program, err := expr.Compile(cm.Expr, expr.Env(envMap))
+						output, err := expr.Run(program, envMap)
+						if err == nil {
+							values[valuePos[i]] = output
+						}
 					}
 				}
 			}
@@ -180,54 +217,6 @@ func mapTo(current interface{}, s ...interface{}) interface{} {
 		}
 	}
 	return current
-}
-
-func (c *MySQLConsumer) prepare(e *canal.RowsEvent) error {
-	c.Lock.Lock()
-	defer c.Lock.Unlock()
-	sqlStr := ""
-	var args []int
-	switch e.Action {
-	case canal.InsertAction:
-		if c.InsertStmt != nil {
-			return nil
-		}
-		sqlStr, args = c.toInsert(e)
-	case canal.UpdateAction:
-		if c.ReplaceStmt != nil {
-			return nil
-		}
-		sqlStr, args = c.toInsert(e)
-	case canal.DeleteAction:
-		if c.DeleteStmt != nil {
-			return nil
-		}
-		sqlStr, args = c.toDelete(e)
-	default:
-		return nil
-	}
-	if len(sqlStr) == 0 {
-		return errors.New("error generating sql statement")
-	}
-	stmt, err := c.DB.Prepare(sqlStr)
-	if err != nil {
-		log.Errorf("Accept prepare stmt,  sql:%s error: %s\n", sqlStr, err.Error())
-		return err
-	}
-	switch e.Action {
-	case canal.InsertAction:
-		c.InsertStmt = stmt
-	case canal.UpdateAction:
-		c.ReplaceStmt = stmt
-	case canal.DeleteAction:
-		c.DeleteStmt = stmt
-	default:
-		return nil
-	}
-	if e.Action != canal.DeleteAction {
-		c.ValuePos = args
-	}
-	return nil
 }
 
 // 这个部分可以缓存，不用每次都generate一次， 条件是， mapping 是同一个， 如果 e.Table.name 相同，则直接取 preparedStmt
@@ -257,45 +246,74 @@ func (c *MySQLConsumer) toInsert(e *canal.RowsEvent) (string, []int) {
 // 取出主键，取出对应的值，生成Delete语句即可
 func (c *MySQLConsumer) toDelete(e *canal.RowsEvent) (string, []int) {
 	if c.Mapping == nil || c.Mapping.ColMappings == nil {
-		rawSql := fmt.Sprintf("DELETE FROM `%s` WHERE ", e.Table.Name)
-		where := ""
+		prefix := fmt.Sprintf("DELETE FROM `%s` WHERE ", e.Table.Name)
+
+		// 拼头部如 (id, type) IN
+		condHeader := strings.Builder{}
+		condHeader.WriteString("(")
 		for i, v := range e.Table.PKColumns {
-			colName := e.Table.Columns[v].Name
-			where += fmt.Sprintf("`%s` = ? ", colName)
-			if i < len(e.Table.PKColumns)-1 {
-				where += " AND "
+			condHeader.WriteString(fmt.Sprintf("`%s`", e.Table.Columns[v].Name))
+			if i != len(e.Table.PKColumns)-1 {
+				condHeader.WriteString(", ")
 			}
 		}
-		return rawSql + where, e.Table.PKColumns
+		condHeader.WriteString(") IN ")
+		// 拼写结果如： DELETE FROM demo where (id, one) in ((1, 2), (413, 2))
+		return prefix + condHeader.String() + buildDeletePrimaryWhere(e), e.Table.PKColumns
 	} else {
-		rawSql := fmt.Sprintf("DELETE FROM `%s` WHERE ", c.Mapping.DstTable)
-		where := ""
+		prefix := fmt.Sprintf("DELETE FROM `%s` WHERE ", c.Mapping.DstTable)
+
+		// 构建头部，映射后的：
+		condHeader := strings.Builder{}
+		condHeader.WriteString("(")
 		for i, v := range e.Table.PKColumns {
 			// 只用映射的字段, 这里或许可以优化
 			colName := e.Table.Columns[v].Name
-			for _, v := range c.Mapping.ColMappings {
-				if colName == v.Src {
-					where += fmt.Sprintf("`%s` = ? ", v.Dst)
-					break
-				}
-			}
+			dstName := getDstName(c, colName)
+			condHeader.WriteString(fmt.Sprintf("`%s`", dstName))
 			if i < len(e.Table.PKColumns)-1 {
-				where += " AND "
+				condHeader.WriteString(", ")
 			}
 		}
-		return rawSql + where, e.Table.PKColumns
+		condHeader.WriteString(") IN ")
+		return prefix + condHeader.String() + buildDeletePrimaryWhere(e), e.Table.PKColumns
 	}
-	//
-	//if c.Mapping.ColMappings
-	//return "DELETE FROM " +
-	//	positions := e.Table.PKColumns
-
-	return "", nil
 }
 
+func getDstName(c *MySQLConsumer, colName string) string {
+	for _, v := range c.Mapping.ColMappings {
+		if colName == v.Src {
+			return v.Dst
+		}
+	}
+	return ""
+}
+
+// 拼值 如： ((1, 2), (413, 2))
+func buildDeletePrimaryWhere(e *canal.RowsEvent) string {
+	where := strings.Builder{}
+	where.WriteString("(")
+	rowNum := len(e.Rows)
+	for i := 0; i < rowNum; i++ {
+		where.WriteString("(")
+		for p := range e.Table.PKColumns {
+			where.WriteString("?")
+			if p != len(e.Table.Columns)-1 {
+				where.WriteString(", ")
+			}
+		}
+		where.WriteString(")")
+		if i != rowNum-1 {
+			where.WriteString(", ")
+		}
+	}
+	where.WriteString(");")
+	return where.String()
+}
+
+// 根据原表直接生成SQL
 func generateByMappings(mapping *mapper.TableMapping, e *canal.RowsEvent) (string, []int) {
 	locations := make([]int, 0, 8)
-
 	for _, m := range mapping.ColMappings {
 		for j, c := range e.Table.Columns {
 			// 如果对的上列, 那么就把这个列的位置记录下来
@@ -304,54 +322,86 @@ func generateByMappings(mapping *mapper.TableMapping, e *canal.RowsEvent) (strin
 			}
 		}
 	}
-
 	if len(locations) != len(mapping.ColMappings) {
-		// 配置有误， mapping 里面存在binlog中不包含的列，无法处理
-		// 如有后续需求，可额外扩展
+		// 配置有误， mapping 里面存在binlog中不包含的列，无法处理， 如有后续需求，可额外扩展
+		log.Errorf("mappings may not correct: %v\n", mapping.ColMappings)
 		return "", nil
 	}
 
-	colStr, valueStr := strings.Builder{}, strings.Builder{}
+	// 拼头部信息
+	colStr := strings.Builder{}
+	eventNum := len(e.Rows) / 2
 	sqlType := "REPLACE INTO"
-	if e.Header == nil {
+	if e.Action == canal.InsertAction {
 		sqlType = "INSERT IGNORE INTO"
+		eventNum = len(e.Rows)
 	}
 	colStr.WriteString(fmt.Sprintf(sqlType+" `%s`", mapping.DstTable))
-	valueStr.WriteString("VALUES")
 	colStr.WriteString("(")
-	valueStr.WriteString("(")
 	for i, v := range mapping.ColMappings {
 		colStr.WriteString(fmt.Sprintf("`%s`", v.Dst))
-		valueStr.WriteString("?")
 		if i != len(mapping.ColMappings)-1 {
 			colStr.WriteString(", ")
+		}
+	}
+	colStr.WriteString(") VALUES")
+
+	// 构建值
+	valueStr := strings.Builder{}
+	for i := 0; i < eventNum; i++ {
+		valueStr.WriteString("(")
+		for i, _ := range mapping.ColMappings {
+			valueStr.WriteString("?")
+			if i != len(mapping.ColMappings)-1 {
+				valueStr.WriteString(", ")
+			}
+		}
+		valueStr.WriteString(")")
+		if i == eventNum-1 {
+			valueStr.WriteString(";")
+		} else {
 			valueStr.WriteString(", ")
 		}
 	}
-	colStr.WriteString(")")
-	valueStr.WriteString(");")
 	return colStr.String() + valueStr.String(), locations
 }
 
+// 根据映射直接生成SQL
 func generateBySrcTable(dst string, e *canal.RowsEvent) string {
-	colStr, valueStr := strings.Builder{}, strings.Builder{}
+	colStr := strings.Builder{}
 	sqlType := "REPLACE INTO"
-	if e.Header == nil {
+	eventNum := len(e.Rows) / 2
+	if e.Action == canal.InsertAction {
 		sqlType = "INSERT IGNORE INTO"
+		eventNum = len(e.Rows)
 	}
 	colStr.WriteString(fmt.Sprintf(sqlType+" `%s`", dst))
-	valueStr.WriteString("VALUES")
 	colStr.WriteString("(")
-	valueStr.WriteString("(")
+
 	for i, v := range e.Table.Columns {
 		colStr.WriteString(fmt.Sprintf("`%s`", v.Name))
-		valueStr.WriteString("?")
 		if i != len(e.Table.Columns)-1 {
 			colStr.WriteString(", ")
+		}
+	}
+	colStr.WriteString(") VALUES")
+
+	// 	构建值
+	valueStr := strings.Builder{}
+	for i := 0; i < eventNum; i++ {
+		valueStr.WriteString("(")
+		for i := range e.Table.Columns {
+			valueStr.WriteString("?")
+			if i != len(e.Table.Columns)-1 {
+				valueStr.WriteString(", ")
+			}
+		}
+		valueStr.WriteString(")")
+		if i == eventNum-1 {
+			valueStr.WriteString(";")
+		} else {
 			valueStr.WriteString(", ")
 		}
 	}
-	colStr.WriteString(")")
-	valueStr.WriteString(");")
 	return colStr.String() + valueStr.String()
 }
