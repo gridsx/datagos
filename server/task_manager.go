@@ -2,7 +2,7 @@ package server
 
 import (
 	"errors"
-	"github.com/gridsx/datagos/canal/mysql"
+	"github.com/gridsx/datagos/blender"
 	"github.com/gridsx/datagos/task"
 )
 
@@ -23,7 +23,7 @@ func (m *manager) Start() error {
 
 	switch tsk.SrcType {
 	case int(task.SrcMySQL):
-		canal := mysql.NewMySQLCanalTask(tsk)
+		canal := blender.NewMySQLCanalTask(tsk)
 		if canal == nil {
 			return errors.New("error creating mysql canal")
 		}

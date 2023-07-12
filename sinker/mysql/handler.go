@@ -1,14 +1,13 @@
-package sinker
+package mysql
 
 import (
-	"github.com/gridsx/datagos/canal/common"
+	"github.com/gridsx/datagos/common"
 	"sync/atomic"
 	"time"
 
 	"github.com/go-mysql-org/go-mysql/canal"
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/replication"
-	"github.com/gridsx/datagos/canal/mysql/meta"
 	"github.com/siddontang/go-log/log"
 )
 
@@ -21,7 +20,6 @@ type MySQLBinlogHandler struct {
 	canal.DummyEventHandler
 	Sinkers []common.Sinker
 	C       *canal.Canal
-	Inst    *meta.MySQLSrcConfig
 }
 
 // OnRow 对于 DUMP, 此处的区别是 Header是否为空, 可以判断如果header为空用 insert ignore into, 否则用replace into

@@ -1,19 +1,20 @@
-package mysql
+package blender
 
 import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/gridsx/datagos/canal/common"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	mysqlCanal "github.com/gridsx/datagos/canal/mysql"
+	"github.com/gridsx/datagos/common"
+	mysqlSinker "github.com/gridsx/datagos/sinker/mysql"
+	"github.com/gridsx/datagos/task"
+
 	"github.com/go-mysql-org/go-mysql/canal"
 	"github.com/go-mysql-org/go-mysql/mysql"
-	"github.com/gridsx/datagos/canal/mysql/meta"
-	"github.com/gridsx/datagos/canal/mysql/sinker"
-	"github.com/gridsx/datagos/task"
 	"github.com/siddontang/go-log/log"
 )
 
@@ -26,10 +27,8 @@ type CanalTask struct {
 	c          *canal.Canal
 	dumpFinish chan bool
 	dump       bool
-	dumpPos    mysql.Position
 	key        string
 	running    bool
-	Inst       *meta.MySQLSrcConfig
 	seconds    int64
 	lock       sync.Mutex
 	mgr        *task.Task
@@ -44,11 +43,10 @@ func (t *CanalTask) onDumpFinish() {
 // 取位点较小的做为 下次启动开始消费的点
 func (t *CanalTask) Start() error {
 	if t.running {
-		log.Warnf("canal task start, already running, task: %s\n", t.Inst.MySQLInstance.Host)
+		log.Warnf("canal task start, already running, task: %s\n", t.mgr.Title)
 		return nil
 	}
 	err := t.mgr.UpdateTaskState(task.Running)
-
 	if err != nil {
 		return err
 	}
@@ -67,8 +65,9 @@ func (t *CanalTask) Start() error {
 
 	// 如果任务本身有position， 拿任务本身的position， 没有的话拿当前binlog点位
 	var pos *mysql.Position
-	if t.Inst.Position != nil {
-		pos = t.Inst.Position
+	if t == nil {
+		// TODO 记录POSITION 相关
+		//pos = t.Inst.Position
 	} else {
 		if t.dump {
 			syncedPos := t.c.SyncedPosition()
@@ -157,7 +156,22 @@ func NewMySQLCanalTask(t *task.Task) *CanalTask {
 	if sinkers == nil {
 		return nil
 	}
-	return newCanalTask(t, sinkers)
+
+	cx, dump, err := mysqlCanal.NewMySQLCanal(t.Src)
+	if err != nil {
+		log.Errorln("NewMySQLCanalTask create canal failed!")
+		return nil
+	}
+
+	cx.SetEventHandler(&mysqlSinker.MySQLBinlogHandler{Sinkers: sinkers, C: cx})
+	return &CanalTask{
+		c:          cx,
+		dumpFinish: make(chan bool),
+		dump:       dump,
+		key:        fmt.Sprintf("%d", t.Id),
+		lock:       sync.Mutex{},
+		mgr:        t,
+	}
 }
 
 func builderSinkers(t *task.Task) []common.Sinker {
@@ -167,73 +181,23 @@ func builderSinkers(t *task.Task) []common.Sinker {
 	}
 	sinkers := make([]common.Sinker, 0, len(dest))
 	for _, d := range dest {
-		cfg := new(meta.MySQLSinkerConfig)
+		cfg := new(mysqlSinker.MySQLSinkerConfig)
 		_ = json.Unmarshal([]byte(d.Config), cfg)
 		filters := cfg.Filters
-		consumers := make([]*sinker.MySQLConsumer, 0, 4)
+		consumers := make([]*mysqlSinker.MySQLConsumer, 0, 4)
 		instDB := cfg.DestDatasource.ToDatasource()
 		for _, m := range cfg.Mappings {
-			consumers = append(consumers, &sinker.MySQLConsumer{
+			consumers = append(consumers, &mysqlSinker.MySQLConsumer{
 				DB:      instDB,
 				Mapping: &m,
 				Lock:    sync.Mutex{},
 			})
 		}
-		sinkers = append(sinkers, &sinker.MySQLSinker{
+		sinkers = append(sinkers, &mysqlSinker.MySQLSinker{
 			ErrorContinue: cfg.ErrorContinue,
 			Filters:       filters,
 			Consumers:     consumers,
 		})
 	}
 	return sinkers
-}
-
-func newCanalTask(t *task.Task, sinkers []common.Sinker) *CanalTask {
-	s := new(meta.MySQLSrcConfig)
-	err := json.Unmarshal([]byte(t.Src), s)
-	if err != nil {
-		return nil
-	}
-
-	c := s.ToServerConfig()
-	cfg := canal.NewDefaultConfig()
-	cfg.Addr = fmt.Sprintf("%s:%d", c.MasterInfo.Host, c.MasterInfo.Port)
-	cfg.User = c.MasterInfo.Username
-	cfg.Password = c.MasterInfo.Password
-	cfg.HeartbeatPeriod = time.Second * 5
-	cfg.DiscardNoMetaRowEvent = true
-	cfg.TimestampStringLocation = time.UTC
-
-	// TODO 补充 filter.
-	// cfg.ExcludeTableRegex, 是否拉取这个日志
-	// cfg.IncludeTableRegex， 是否拉取
-
-	if c.DumpFilter != nil {
-		// 全量配置相关
-		cfg.Dump.ExecutionPath = `mysqldump`
-		cfg.Dump.SkipMasterData = true
-		cfg.Dump.Databases = c.DumpFilter.Databases
-		cfg.Dump.Where = c.DumpFilter.Where
-		cfg.Dump.TableDB = c.DumpFilter.TableDB
-		cfg.Dump.Tables = c.DumpFilter.Tables
-		cfg.Dump.IgnoreTables = c.DumpFilter.IgnoreTables
-	} else {
-		cfg.Dump.ExecutionPath = ""
-	}
-
-	cx, err := canal.NewCanal(cfg)
-	if err != nil {
-		log.Errorln(err)
-		return nil
-	}
-	cx.SetEventHandler(&sinker.MySQLBinlogHandler{Inst: s, Sinkers: sinkers, C: cx})
-	return &CanalTask{
-		c:          cx,
-		Inst:       s,
-		dumpFinish: make(chan bool),
-		dump:       c.DumpFilter != nil, // TODO dump finished
-		key:        fmt.Sprintf("%d", t.Id),
-		lock:       sync.Mutex{},
-		mgr:        t,
-	}
 }
