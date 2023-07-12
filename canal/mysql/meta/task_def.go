@@ -4,8 +4,8 @@ import (
 	"encoding/json"
 	"time"
 
-	"github.com/gridsx/datagos/filter"
-	"github.com/gridsx/datagos/mapper"
+	"github.com/gridsx/datagos/canal/mysql/filter"
+	"github.com/gridsx/datagos/canal/mysql/mapper"
 	"github.com/siddontang/go-log/log"
 )
 
@@ -24,7 +24,7 @@ type MySQLTaskInfo struct {
 	Updated        time.Time `json:"updated"`
 }
 
-func (t *MySQLTaskInfo) Filters() []filter.Filter {
+func (t *MySQLTaskInfo) Filters() []filter.MySQLFilter {
 	dataFilters := make([]*filter.EventDataFilter, 0, 4)
 	if len(t.DataFilter) > 0 {
 		err := json.Unmarshal([]byte(t.DataFilter), &dataFilters)
@@ -39,7 +39,7 @@ func (t *MySQLTaskInfo) Filters() []filter.Filter {
 			log.Warnf("Filters convert table filter failed: %s\n", t.TableFilter)
 		}
 	}
-	filters := make([]filter.Filter, 0, 4)
+	filters := make([]filter.MySQLFilter, 0, 4)
 
 	if len(dataFilters) > 0 {
 		for _, v := range dataFilters {

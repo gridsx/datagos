@@ -1,30 +1,35 @@
 package sinker
 
+import "github.com/gridsx/datagos/canal/mysql/filter"
+
+// binlog过来是顺序的
+// sinker 如果保证顺序写入，在请求量大的时候，则消费速度明显跟不上
+// 如果不保证顺序写入，则接收端可能会有问题
+
 import (
 	"database/sql"
 	"fmt"
-	"github.com/antonmedv/expr"
 	"strings"
 	"sync"
 
+	"github.com/antonmedv/expr"
 	"github.com/go-mysql-org/go-mysql/canal"
-	"github.com/gridsx/datagos/filter"
-	"github.com/gridsx/datagos/mapper"
+	"github.com/gridsx/datagos/canal/mysql/mapper"
 	"github.com/siddontang/go-log/log"
 )
 
 type MySQLSinker struct {
 	disabled      bool
-	ErrorContinue bool             `json:"errorContinue"`
-	Filters       []filter.Filter  `json:"filters"`
-	Consumers     []*MySQLConsumer `json:"consumers"`
+	ErrorContinue bool                 `json:"errorContinue"`
+	Filters       []filter.MySQLFilter `json:"filters"`
+	Consumers     []*MySQLConsumer     `json:"consumers"`
 }
 
-func (s *MySQLSinker) enable() bool {
+func (s *MySQLSinker) Enable() bool {
 	return !s.disabled
 }
 
-func (s *MySQLSinker) disable() {
+func (s *MySQLSinker) Disable() {
 	s.disabled = true
 }
 
@@ -41,7 +46,7 @@ func (s *MySQLSinker) filtered(e *canal.RowsEvent) bool {
 }
 
 // 事件处理逻辑
-func (s *MySQLSinker) onEvent(e *canal.RowsEvent) error {
+func (s *MySQLSinker) OnEvent(e *canal.RowsEvent) error {
 	if s.filtered(e) {
 		return nil
 	}
@@ -61,7 +66,7 @@ func (s *MySQLSinker) onEvent(e *canal.RowsEvent) error {
 	return nil
 }
 
-func (s *MySQLSinker) continueOnError() bool {
+func (s *MySQLSinker) ContinueOnError() bool {
 	return s.ErrorContinue
 }
 
@@ -248,7 +253,7 @@ func (c *MySQLConsumer) toInsert(e *canal.RowsEvent) (string, []int) {
 
 // 取出主键，取出对应的值，生成Delete语句即可
 func (c *MySQLConsumer) toDelete(e *canal.RowsEvent) (string, []int) {
-	if c.Mapping == nil || c.Mapping.ColMappings == nil {
+	if c.Mapping == nil {
 		prefix := fmt.Sprintf("DELETE FROM `%s` WHERE ", e.Table.Name)
 
 		// 拼头部如 (id, type) IN
@@ -289,7 +294,7 @@ func getDstName(c *MySQLConsumer, colName string) string {
 			return v.Dst
 		}
 	}
-	return ""
+	return colName
 }
 
 // 拼值 如： ((1, 2), (413, 2))
@@ -301,7 +306,7 @@ func buildDeletePrimaryWhere(e *canal.RowsEvent) string {
 		where.WriteString("(")
 		for p := range e.Table.PKColumns {
 			where.WriteString("?")
-			if p != len(e.Table.Columns)-1 {
+			if p != len(e.Table.PKColumns)-1 {
 				where.WriteString(", ")
 			}
 		}

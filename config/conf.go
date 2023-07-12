@@ -1,8 +1,9 @@
 package config
 
 import (
-	config "github.com/winjeg/go-commons/conf"
 	"sync"
+
+	config "github.com/winjeg/go-commons/conf"
 )
 
 var (

@@ -1,5 +1,5 @@
 mysql:
-  host: 127.0.0.1
+  host: 10.10.10.10
   port: 3306
   username: tuser
   password: 1234zxcv

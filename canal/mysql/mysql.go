@@ -1,16 +1,20 @@
-package task
+package mysql
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/go-mysql-org/go-mysql/canal"
-	"github.com/go-mysql-org/go-mysql/mysql"
-	"github.com/gridsx/datagos/meta"
-	"github.com/gridsx/datagos/sinker"
-	"github.com/siddontang/go-log/log"
+	"github.com/gridsx/datagos/canal/common"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/go-mysql-org/go-mysql/canal"
+	"github.com/go-mysql-org/go-mysql/mysql"
+	"github.com/gridsx/datagos/canal/mysql/meta"
+	"github.com/gridsx/datagos/canal/mysql/sinker"
+	"github.com/gridsx/datagos/task"
+	"github.com/siddontang/go-log/log"
 )
 
 const dumpExec = "mysqldump"
@@ -25,18 +29,14 @@ type CanalTask struct {
 	dumpPos    mysql.Position
 	key        string
 	running    bool
-	Inst       *meta.InstanceInfo
+	Inst       *meta.MySQLSrcConfig
 	seconds    int64
 	lock       sync.Mutex
+	mgr        *task.Task
 }
 
 func (t *CanalTask) onDumpFinish() {
-	go func() {
-		err := meta.Manager.UpdateDumpConfig(t.Inst.Id, "")
-		if err != nil {
-			log.Errorf("onDumpFinish dump finish update db failed! error : %v\n", err)
-		}
-	}()
+	//  TODO 记录dump是否完成， 如果已经完成， 那么下次开始的时候，则不需要dump
 }
 
 // Start 开始任务, 如果任务中包含全量， 则新起slave 监听
@@ -44,18 +44,11 @@ func (t *CanalTask) onDumpFinish() {
 // 取位点较小的做为 下次启动开始消费的点
 func (t *CanalTask) Start() error {
 	if t.running {
-		log.Warnf("canal task start, already running, task: %d\n", t.Inst.Id)
+		log.Warnf("canal task start, already running, task: %s\n", t.Inst.MySQLInstance.Host)
 		return nil
 	}
-	t.lock.Lock()
-	// 开始的时候就放内存里管理
-	if GetTask(fmt.Sprintf("%d", t.Inst.Id)) != nil {
-		t.lock.Unlock()
-		return nil
-	}
-	StoreTask(t)
-	t.lock.Unlock()
-	err := meta.Manager.UpdateInstanceState(t.Inst.Id, meta.InstanceRunning)
+	err := t.mgr.UpdateTaskState(task.Running)
+
 	if err != nil {
 		return err
 	}
@@ -67,51 +60,37 @@ func (t *CanalTask) Start() error {
 		dumpErr := t.c.Dump()
 		if dumpErr != nil {
 			t.Stop()
-			RemoveTask(t)
 			return dumpErr
 		}
 		t.onDumpFinish()
 	}
 
-	if t.HasRunning() {
-		//  TODO 如果有正在跑的， 复杂一些， 需要拿到可以处理对方任务的 canal并停下来， 拿到 它的binlog位点
-		// 与已有的进行比较， 当然同一个 slave 的复制任务应该在同一个节点上， 这个要保证
-		pos, err := t.c.GetMasterPos()
-		if err != nil {
-			log.Errorf("error getting master pos after dump, %v", pos)
-			return err
-		}
-		t.dumpPos = pos
-		t.Stop()
-
+	// 如果任务本身有position， 拿任务本身的position， 没有的话拿当前binlog点位
+	var pos *mysql.Position
+	if t.Inst.Position != nil {
+		pos = t.Inst.Position
 	} else {
-		// 如果任务本身有position， 拿任务本身的position， 没有的话拿当前binlog点位
-		var pos *mysql.Position
-		if len(t.Inst.Position) > 0 {
-			pos = t.Inst.ToPosition()
+		if t.dump {
+			syncedPos := t.c.SyncedPosition()
+			pos = &syncedPos
 		} else {
-			if t.dump {
-				syncedPos := t.c.SyncedPosition()
-				pos = &syncedPos
-			} else {
-				if pos == nil {
-					masterPos, posErr := t.c.GetMasterPos()
-					if posErr == nil {
-						pos = &masterPos
-					}
+			if pos == nil {
+				masterPos, posErr := t.c.GetMasterPos()
+				if posErr == nil {
+					pos = &masterPos
 				}
 			}
 		}
+	}
 
-		if pos == nil {
-			return errors.New("error getting position")
-		}
-		err := t.c.RunFrom(*pos)
+	if pos == nil {
+		return errors.New("error getting position")
+	}
+	runErr := t.c.RunFrom(*pos)
 
-		if err != nil {
-			t.Stop()
-			return err
-		}
+	if runErr != nil {
+		t.Stop()
+		return runErr
 	}
 	return nil
 }
@@ -126,10 +105,7 @@ func (t *CanalTask) updateBinlog() {
 				lastSecond := atomic.LoadInt64(&t.seconds)
 				if nowSecond-lastSecond > binlogPosSaveDuration {
 					atomic.StoreInt64(&t.seconds, nowSecond)
-					err := meta.Manager.SavePosition(t.Inst.Id, t.c.SyncedPosition())
-					if err != nil {
-						log.Errorf("binlog save task failed, error: %v", err)
-					}
+					t.updateTaskBinlog()
 				}
 			} else {
 				break
@@ -138,32 +114,31 @@ func (t *CanalTask) updateBinlog() {
 	}()
 }
 
-// HasRunning 判断是否有正在运行的slave
-// TODO 实现
-// 与 zk 进行交互，拿到所有节点正在运行的任务信息
-func (t *CanalTask) HasRunning() bool {
-	return false
-}
-
 // Stop 停止任务， 停止canal的消费，取消slave监听， 停掉的时候需要记录 binlog  position
 func (t *CanalTask) Stop() {
 	if !t.running {
-		log.Warnf("canal task stop already stopped, task id : %d\n", t.Inst.Id)
+		log.Warnf("canal task stop already stopped, task id : %d\n", t.mgr.Id)
 		return
 	}
 	t.lock.Lock()
 	defer t.lock.Unlock()
 	t.running = false
-	RemoveTask(t)
-	err := meta.Manager.SavePosition(t.Inst.Id, t.c.SyncedPosition())
-	if err != nil {
-		log.Errorf("error updating instance position: %v\n", err)
-	}
-	uerr := meta.Manager.UpdateInstanceState(t.Inst.Id, meta.InstanceStopped)
+	t.updateTaskBinlog()
+	uerr := t.mgr.UpdateTaskState(task.Stopped)
 	if uerr != nil {
 		log.Errorf("error updating instance state: %v\n", uerr)
 	}
 	t.c.Close()
+}
+
+func (t *CanalTask) updateTaskBinlog() {
+	infoMap := make(map[string]interface{}, 1)
+	infoMap["position"] = t.c.SyncedPosition()
+	d, _ := json.Marshal(infoMap)
+	err := t.mgr.UpdateTaskInfo(string(d))
+	if err != nil {
+		log.Errorf("error updating instance position: %v\n", err)
+	}
 }
 
 func (t *CanalTask) Running() bool {
@@ -174,9 +149,26 @@ func (t *CanalTask) GetDelay() uint32 {
 	return t.c.GetDelay()
 }
 
-func NewMySQLCanalTask(s *meta.InstanceInfo, sinkerConfigs []meta.MySQLSinkerConfig) *CanalTask {
-	sinkers := make([]sinker.Sinker, 0, 4)
-	for _, cfg := range sinkerConfigs {
+func NewMySQLCanalTask(t *task.Task) *CanalTask {
+	if t.SrcType != int(task.SrcMySQL) {
+		return nil
+	}
+	sinkers := builderSinkers(t)
+	if sinkers == nil {
+		return nil
+	}
+	return newCanalTask(t, sinkers)
+}
+
+func builderSinkers(t *task.Task) []common.Sinker {
+	dest, err := t.GetDest()
+	if err != nil {
+		return nil
+	}
+	sinkers := make([]common.Sinker, 0, len(dest))
+	for _, d := range dest {
+		cfg := new(meta.MySQLSinkerConfig)
+		_ = json.Unmarshal([]byte(d.Config), cfg)
 		filters := cfg.Filters
 		consumers := make([]*sinker.MySQLConsumer, 0, 4)
 		instDB := cfg.DestDatasource.ToDatasource()
@@ -193,10 +185,16 @@ func NewMySQLCanalTask(s *meta.InstanceInfo, sinkerConfigs []meta.MySQLSinkerCon
 			Consumers:     consumers,
 		})
 	}
-	return NewCanalTask(s, sinkers)
+	return sinkers
 }
 
-func NewCanalTask(s *meta.InstanceInfo, sinkers []sinker.Sinker) *CanalTask {
+func newCanalTask(t *task.Task, sinkers []common.Sinker) *CanalTask {
+	s := new(meta.MySQLSrcConfig)
+	err := json.Unmarshal([]byte(t.Src), s)
+	if err != nil {
+		return nil
+	}
+
 	c := s.ToServerConfig()
 	cfg := canal.NewDefaultConfig()
 	cfg.Addr = fmt.Sprintf("%s:%d", c.MasterInfo.Host, c.MasterInfo.Port)
@@ -204,6 +202,7 @@ func NewCanalTask(s *meta.InstanceInfo, sinkers []sinker.Sinker) *CanalTask {
 	cfg.Password = c.MasterInfo.Password
 	cfg.HeartbeatPeriod = time.Second * 5
 	cfg.DiscardNoMetaRowEvent = true
+	cfg.TimestampStringLocation = time.UTC
 
 	// TODO 补充 filter.
 	// cfg.ExcludeTableRegex, 是否拉取这个日志
@@ -224,17 +223,17 @@ func NewCanalTask(s *meta.InstanceInfo, sinkers []sinker.Sinker) *CanalTask {
 
 	cx, err := canal.NewCanal(cfg)
 	if err != nil {
-		log.Fatal(err)
+		log.Errorln(err)
 		return nil
 	}
-	cx.SetEventHandler(&sinker.BinlogHandler{Inst: s, Sinkers: sinkers, C: cx})
-
+	cx.SetEventHandler(&sinker.MySQLBinlogHandler{Inst: s, Sinkers: sinkers, C: cx})
 	return &CanalTask{
 		c:          cx,
 		Inst:       s,
 		dumpFinish: make(chan bool),
-		dump:       c.DumpFilter != nil,
-		key:        fmt.Sprintf("%d", s.Id),
+		dump:       c.DumpFilter != nil, // TODO dump finished
+		key:        fmt.Sprintf("%d", t.Id),
 		lock:       sync.Mutex{},
+		mgr:        t,
 	}
 }
