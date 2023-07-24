@@ -1,17 +1,19 @@
 package mysql
 
+import "github.com/gridsx/datagos/common"
+
 // binlog过来是顺序的
-// sinker 如果保证顺序写入，在请求量大的时候，则消费速度明显跟不上
-// 如果不保证顺序写入，则接收端可能会有问题
+// sinker 如果保证同一主键顺序写入，不同主键的数据可以并发写入
+// TODO 实现Sinker并发写入
 
 import (
 	"database/sql"
+	"encoding/json"
 	"sync"
 
 	"github.com/go-mysql-org/go-mysql/canal"
 	"github.com/gridsx/datagos/canal/mysql/filter"
 	"github.com/gridsx/datagos/canal/mysql/mapper"
-	"github.com/gridsx/datagos/common"
 	"github.com/siddontang/go-log/log"
 )
 
@@ -202,4 +204,24 @@ func (c *MySQLConsumer) isPrimaryUpdate(e *canal.RowsEvent) bool {
 		}
 	}
 	return false
+}
+
+func Build(c string) *MySQLSinker {
+	cfg := new(MySQLSinkerConfig)
+	_ = json.Unmarshal([]byte(c), cfg)
+	filters := cfg.Filters
+	consumers := make([]*MySQLConsumer, 0, 4)
+	instDB := cfg.DestDatasource.ToDatasource()
+	for _, m := range cfg.Mappings {
+		consumers = append(consumers, &MySQLConsumer{
+			DB:      instDB,
+			Mapping: &m,
+			Lock:    sync.Mutex{},
+		})
+	}
+	return &MySQLSinker{
+		ErrorContinue: cfg.ErrorContinue,
+		Filters:       filters,
+		Consumers:     consumers,
+	}
 }

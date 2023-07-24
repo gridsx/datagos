@@ -181,23 +181,16 @@ func builderSinkers(t *task.Task) []common.Sinker {
 	}
 	sinkers := make([]common.Sinker, 0, len(dest))
 	for _, d := range dest {
-		cfg := new(mysqlSinker.MySQLSinkerConfig)
-		_ = json.Unmarshal([]byte(d.Config), cfg)
-		filters := cfg.Filters
-		consumers := make([]*mysqlSinker.MySQLConsumer, 0, 4)
-		instDB := cfg.DestDatasource.ToDatasource()
-		for _, m := range cfg.Mappings {
-			consumers = append(consumers, &mysqlSinker.MySQLConsumer{
-				DB:      instDB,
-				Mapping: &m,
-				Lock:    sync.Mutex{},
-			})
+		switch d.Type {
+		case int(task.DestMySQL):
+			sinkers = append(sinkers, mysqlSinker.Build(d.Config))
+		case int(task.DestEs):
+		case int(task.DestMongo):
+		case int(task.DestRedis):
+		case int(task.DestRocketMQ):
+		case int(task.DestPostgres):
+		default:
 		}
-		sinkers = append(sinkers, &mysqlSinker.MySQLSinker{
-			ErrorContinue: cfg.ErrorContinue,
-			Filters:       filters,
-			Consumers:     consumers,
-		})
 	}
 	return sinkers
 }
